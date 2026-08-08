@@ -12,7 +12,7 @@
  */
 
 import { broadcastToShow, broadcast } from '../../websocket/wsServer.js';
-import { sendOtp, verifyOtp } from '../payment/gateway.client.js';
+import { sendOTP as sendOtp, verifyOTP as verifyOtp } from '../auth/auth.service.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WebSocket notification helpers
