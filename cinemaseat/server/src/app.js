@@ -6,7 +6,7 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-import { connectPostgres, query } from './db/postgres.js';
+import { connectPostgres, query, runMigrations } from './db/postgres.js';
 import { connectRedis, getRedis } from './db/redis.js';
 import authRoutes      from './modules/auth/auth.routes.js';
 import catalogueRoutes from './modules/catalogue/catalogue.routes.js';
@@ -17,6 +17,7 @@ import { startHoldSweeper } from './modules/booking/holdSweeper.js';
 import { startMetricsBroadcast } from './websocket/wsServer.js';
 import { checkGatewayHealth } from './modules/payment/gateway.client.js';
 import { notifyHoldExpired, notifySeatUpdate } from './modules/notification/notification.service.js';
+import { seedDatabase } from './scripts/seed.js';
 
 const app = express();
 
@@ -77,7 +78,11 @@ app.use(errorHandler);
 
 const start = async () => {
   await connectPostgres();
+  await runMigrations();   // idempotent — creates tables + indexes
   await connectRedis();
+
+  // Seed only if database is empty (idempotent)
+  await seedDatabase();
 
   const PORT = process.env.PORT || 3000;
   const server = app.listen(PORT, () => {
