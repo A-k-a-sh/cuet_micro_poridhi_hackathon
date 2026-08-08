@@ -7,71 +7,26 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    needs: []  # Only runs on push to main (CI already passed via branch protection)
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push server image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./cinemaseat/server
-          push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/cinemaseat-server:latest
-
-      - name: Build and push client image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./cinemaseat/client
-          push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/cinemaseat-client:latest
-          build-args: |
-            VITE_API_URL=${{ secrets.SERVER_PUBLIC_URL }}/api
-            VITE_WS_URL=${{ secrets.WS_PUBLIC_URL }}
-
       - name: Deploy to Poridhi VM
-        uses: appleboy/ssh-action@master
+        uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
+          username: ubuntu
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
-            cd /home/${{ secrets.VM_USER }}/cinemaseat
-            
-            # Pull latest images
-            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/cinemaseat-server:latest
-            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/cinemaseat-client:latest
-            
-            # Create .env if not exists
-            cat > .env << 'EOF'
-            POSTGRES_USER=${{ secrets.POSTGRES_USER }}
-            POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
-            POSTGRES_DB=cinemaseat
-            JWT_SECRET=${{ secrets.JWT_SECRET }}
-            HOLD_TTL_SECONDS=${{ secrets.HOLD_TTL_SECONDS }}
-            SERVER_PUBLIC_URL=${{ secrets.SERVER_PUBLIC_URL }}
-            CLIENT_PUBLIC_URL=${{ secrets.CLIENT_PUBLIC_URL }}
-            WS_PUBLIC_URL=${{ secrets.WS_PUBLIC_URL }}
-            DOCKER_IMAGE_SERVER=${{ secrets.DOCKERHUB_USERNAME }}/cinemaseat-server:latest
-            DOCKER_IMAGE_CLIENT=${{ secrets.DOCKERHUB_USERNAME }}/cinemaseat-client:latest
-            EOF
-            
-            # Rolling restart (keeps service up during deploy)
-            docker compose -f docker-compose.prod.yml pull
-            docker compose -f docker-compose.prod.yml up -d --no-deps server
-            sleep 5
-            docker compose -f docker-compose.prod.yml up -d --no-deps client
-            
+            cd /home/ubuntu/hackathon/cuet_micro_poridhi_hackathon
+
+            # Pull latest code
+            git pull origin main
+
+            cd cinemaseat
+
+            # Rebuild and restart containers
+            docker compose up -d --build server client
+
             # Health check
-            sleep 3
+            sleep 5
             curl -f http://localhost:3001/health || exit 1
-            echo "Deployment successful"
+            echo "✅ Deployment successful"
