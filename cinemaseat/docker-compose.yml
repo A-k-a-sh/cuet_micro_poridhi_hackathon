@@ -46,6 +46,7 @@ services:
       JWT_SECRET: dev_jwt_secret
       GATEWAY_URL: http://gateway:9000
       CALLBACK_BASE_URL: http://server:3000
+      GATEWAY_SECRET: z2p-2026-secret
       HOLD_TTL_SECONDS: 600
       CLIENT_URL: http://localhost:5173
     depends_on:
