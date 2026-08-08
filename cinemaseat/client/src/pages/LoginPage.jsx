@@ -19,9 +19,6 @@ export default function LoginPage() {
   const navigate = useNavigate();
 
   const pollForCode = (ref) => {
-    // Only in development — auto-fill OTP for demo
-    if (import.meta.env.PROD) return;
-
     const maxAttempts = 15; // 30 seconds max
     let attempts = 0;
 
