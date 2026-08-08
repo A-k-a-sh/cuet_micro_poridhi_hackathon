@@ -112,3 +112,12 @@ export const checkGatewayHealth = async () => {
     return 'down';
   }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// chargeGateway — object-style wrapper used by booking.routes.js
+// Spec: booking.routes.js calls chargeGateway({ amount, currency, booking_ref, callback_url, payment_id })
+// ─────────────────────────────────────────────────────────────────────────────
+export const chargeGateway = ({ amount, currency, booking_ref, callback_url }) => {
+  return initiateCharge(amount, currency, booking_ref, callback_url);
+};
+

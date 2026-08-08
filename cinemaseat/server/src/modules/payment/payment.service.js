@@ -20,6 +20,21 @@ import {
 } from '../notification/notification.service.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
+// createPaymentRecord
+// Called by booking.routes.js /pay before firing the gateway charge.
+// Creates the payments row in 'initiated' status for audit trail.
+// ─────────────────────────────────────────────────────────────────────────────
+export const createPaymentRecord = async (booking_ref, amount) => {
+  const { rows } = await query(
+    `INSERT INTO payments (booking_ref, status, amount, currency)
+     VALUES ($1, 'initiated', $2, 'BDT')
+     RETURNING *`,
+    [booking_ref, amount]
+  );
+  return rows[0];
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // processPaymentCallback
 // Called by POST /api/payments/callback
 // Returns { status } — caller MUST always respond 200 regardless.
