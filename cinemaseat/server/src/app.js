@@ -16,7 +16,7 @@ import bookingRoutes from './modules/booking/booking.routes.js';
 import paymentRoutes from './modules/payment/payment.routes.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { startHoldSweeper } from './modules/booking/holdSweeper.js';
-import { broadcastToShow } from './websocket/wsServer.js';
+import { broadcastToShow, startMetricsBroadcast } from './websocket/wsServer.js';
 
 const app = express();
 
@@ -105,6 +105,9 @@ const start = async () => {
   // WebSocket server attaches to same HTTP server
   const { initWebSocket } = await import('./websocket/wsServer.js');
   initWebSocket(server);
+
+  // Push SYSTEM_METRICS to all connected clients every 10 seconds
+  startMetricsBroadcast(pool, redisClient, 10000);
 
   // Start the hold sweeper, pass callback to broadcast to websocket
   startHoldSweeper(5000, (expiredBooking) => {
