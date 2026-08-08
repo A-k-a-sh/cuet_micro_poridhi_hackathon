@@ -152,12 +152,19 @@ const startMetricsPush = () => {
     try {
       const { getRedis } = await import('../db/redis.js');
       const { query } = await import('../db/postgres.js');
+      const { checkGatewayHealth } = await import('../modules/payment/gateway.client.js');
       const redis = getRedis();
 
-      const [activeHolds, duplicates, gatewayStatus, recentBookings] = await Promise.all([
+      let gatewayStatus = await redis.get('metrics:gateway_status').catch(() => null);
+      if (!gatewayStatus) {
+        const healthy = await checkGatewayHealth();
+        gatewayStatus = healthy ? 'up' : 'down';
+        await redis.set('metrics:gateway_status', gatewayStatus, { EX: 30 });
+      }
+
+      const [activeHolds, duplicates, recentBookings] = await Promise.all([
         redis.get('metrics:active_holds').catch(() => '0'),
         redis.get('metrics:duplicate_callbacks').catch(() => '0'),
-        redis.get('metrics:gateway_status').catch(() => 'unknown'),
         query(`
           SELECT COUNT(*) FROM bookings
           WHERE status = 'confirmed' AND updated_at > NOW() - INTERVAL '60 seconds'
