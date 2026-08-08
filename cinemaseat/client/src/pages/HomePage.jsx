@@ -21,12 +21,27 @@ const MOCK_PREMIERE = {
 export default function HomePage() {
   const [movies, setMovies] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [premiereShowId, setPremiereShowId] = useState('show-spiderman-01');
 
   useEffect(() => {
     api.get('/movies')
-      .then((data) => {
+      .then(async (data) => {
         const list = Array.isArray(data) ? data : data.movies || [];
         setMovies(list.length > 0 ? list : [MOCK_PREMIERE]);
+
+        // Find Spider-Man movie and fetch its shows dynamically
+        const spiderman = list.find(m => m.title && m.title.includes('Spider-Man'));
+        if (spiderman) {
+          try {
+            const shows = await api.get(`/movies/${spiderman.id}/shows`);
+            const showList = Array.isArray(shows) ? shows : shows.shows || [];
+            if (showList.length > 0) {
+              setPremiereShowId(showList[0].id);
+            }
+          } catch (e) {
+            console.error('Failed to fetch shows for premiere:', e);
+          }
+        }
       })
       .catch(() => {
         setMovies([MOCK_PREMIERE]);
@@ -67,7 +82,7 @@ export default function HomePage() {
 
           <div className="flex flex-wrap items-center gap-4 pt-2">
             <Link
-              to="/shows/show-spiderman-01/seats"
+              to={`/shows/${premiereShowId}/seats`}
               className="px-6 py-3.5 rounded-xl bg-[#F5A623] text-[#0A0A0F] font-bold text-sm hover:bg-[#C47D10] transition-all flex items-center gap-2 shadow-xl shadow-[#F5A623]/25 hover:scale-105"
             >
               <Ticket className="w-5 h-5" />

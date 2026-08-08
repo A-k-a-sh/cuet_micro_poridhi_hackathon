@@ -81,7 +81,7 @@ export default function LoginPage() {
   const handleVerifyOTP = async (code) => {
     setLoading(true);
     try {
-      const res = await api.post('/auth/otp/verify', { phone, code });
+      const res = await api.post('/auth/otp/verify', { ref: otpRef, code });
       const token = res.token || res.jwt || `mock_jwt_${Date.now()}`;
       setAuth(token, phone);
       toast.success('Login successful!');
