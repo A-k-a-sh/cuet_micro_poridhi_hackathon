@@ -39,36 +39,51 @@ export const processPaymentCallback = async (payload) => {
       throw new Error(`Payment ID mismatch for booking ${booking_ref}`);
     }
     
-    // Idempotency: If booking is already confirmed or failed, do not process again
-    if (booking.status !== 'PENDING_PAYMENT') {
-      console.log(`[Payment] Booking ${booking_ref} is already in state ${booking.status}. Ignoring callback.`);
+    // Idempotency: valid entry states per event type
+    const validEntryStates = {
+      SUCCEEDED: 'PENDING_PAYMENT',
+      FAILED:    'PENDING_PAYMENT',
+      REFUNDED:  'REFUND_PENDING',
+    };
+    const expectedState = validEntryStates[status];
+    if (!expectedState || booking.status !== expectedState) {
+      console.log(`[Payment] Booking ${booking_ref} in state ${booking.status}, expected ${expectedState} for event ${status}. Ignoring.`);
       await client.query('COMMIT');
       return { status: 'ignored_invalid_state' };
     }
 
     if (status === 'SUCCEEDED') {
-      // Update booking to OTP_PENDING (or CONFIRMED depending on OTP flow requirement)
+      // PENDING_PAYMENT → OTP_PENDING (user must verify OTP to fully confirm)
       await client.query(
         "UPDATE bookings SET status = 'OTP_PENDING' WHERE booking_ref = $1",
         [booking_ref]
       );
-      
-      // Update seat status to confirmed
+      // Seat is now logically confirmed — lock it down
       await client.query(
         "UPDATE seats SET status = 'confirmed' WHERE id = $1",
         [booking.seat_id]
       );
     } else if (status === 'FAILED') {
-      // Payment failed, release the seat
+      // PENDING_PAYMENT → FAILED, release the seat
       await client.query(
         "UPDATE bookings SET status = 'FAILED' WHERE booking_ref = $1",
         [booking_ref]
       );
-      
       await client.query(
         "UPDATE seats SET status = 'available' WHERE id = $1",
         [booking.seat_id]
       );
+    } else if (status === 'REFUNDED') {
+      // REFUND_PENDING → REFUNDED, seat goes back to available
+      await client.query(
+        "UPDATE bookings SET status = 'REFUNDED' WHERE booking_ref = $1",
+        [booking_ref]
+      );
+      await client.query(
+        "UPDATE seats SET status = 'available' WHERE id = $1",
+        [booking.seat_id]
+      );
+      console.log(`[Payment] Refund completed for booking ${booking_ref}. Seat released.`);
     }
     
     await client.query('COMMIT');
