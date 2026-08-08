@@ -2,7 +2,7 @@
 
 A scalable, concurrent-safe movie ticket booking system built for the IEEE CS CUET Ultimate Hackathon.
 
-**Live URL:** http://18.142.222.117:5173/`
+**Live URL:** http://18.142.222.117:5173/
 
 ---
 
