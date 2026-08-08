@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cinemaseat}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cinemaseat_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-cinemaseat}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cinemaseat"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  gateway:
+    image: asifmahmoud414/mock-gateway:latest
+    ports:
+      - "9000:9000"
+
+  server:
+    build: ./server
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-cinemaseat}:${POSTGRES_PASSWORD:-cinemaseat_pass}@postgres:5432/${POSTGRES_DB:-cinemaseat}
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-prod_jwt_secret}
+      GATEWAY_URL: http://gateway:9000
+      CALLBACK_BASE_URL: http://server:3000
+      HOLD_TTL_SECONDS: ${HOLD_TTL_SECONDS:-600}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  client:
+    build: ./client
+    ports:
+      - "80:5173"
+    depends_on:
+      - server
+
+volumes:
+  pgdata:
+  redisdata:
