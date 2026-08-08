@@ -16,7 +16,11 @@ export const sendOTP = async (phone) => {
   try {
     // Update gateway status
     await redis.set('metrics:gateway_status', 'up', { EX: 30 });
-    await axios.post(`${GATEWAY}/otp/send`, { phone, ref });
+    await axios.post(`${GATEWAY}/otp/send`, {
+      phone,
+      ref,
+      callback_url: `${process.env.CALLBACK_BASE_URL}/api/auth/webhooks/otp`
+    });
   } catch (err) {
     await redis.set('metrics:gateway_status', 'down', { EX: 30 });
     // Still return ref — OTP may be delayed (per spec: 10% delay or never delivered)

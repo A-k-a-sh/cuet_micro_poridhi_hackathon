@@ -14,6 +14,7 @@ import { sendOTP, verifyOTP, verifyBookingOTP } from './auth.service.js';
 import { requireAuth } from '../../middleware/auth.js';
 import { otpLimiter } from '../../middleware/rateLimiter.js';
 import { confirmBookingAfterOTP } from '../booking/booking.service.js';
+import { handleOTPCallback, getOTPCode } from './otp.webhook.js';
 
 const router = Router();
 
@@ -55,6 +56,20 @@ router.post('/otp/booking-verify', requireAuth, async (req, res, next) => {
     const booking = await confirmBookingAfterOTP(booking_ref, phone);
     res.json(booking);
   } catch (err) { next(err); }
+});
+
+// POST /api/auth/webhooks/otp
+// Called BY the gateway when an OTP code is generated.
+// No auth. Must always return 200.
+router.post('/webhooks/otp', handleOTPCallback);
+
+// GET /api/auth/otp/code/:ref
+// DEV ONLY — retrieve OTP code for demo (simulates SMS delivery)
+router.get('/otp/code/:ref', async (req, res, next) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  await getOTPCode(req, res);
 });
 
 export default router;
