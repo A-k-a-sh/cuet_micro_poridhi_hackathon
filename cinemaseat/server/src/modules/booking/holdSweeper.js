@@ -1,41 +1,83 @@
-import pool from '../../db/postgres.js';
+/**
+ * holdSweeper.js
+ * Background job: sweeps expired holds from show_seats and releases Redis keys.
+ * Architecture spec: src/modules/booking/holdSweeper.js
+ *
+ * Runs every `intervalMs` (default 30 000 ms per spec).
+ * For each expired hold it:
+ *   1. Resets show_seats back to 'available' in Postgres
+ *   2. DELetes the Redis hold key so the seat map fast-path is consistent
+ *   3. Calls onExpired(row) so wsServer can broadcast HOLD_EXPIRED + SEAT_UPDATE
+ */
 
+import { query } from '../../db/postgres.js';
+import { getRedis } from '../../db/redis.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// sweepExpiredHolds
+// SQL from architecture/database spec — single atomic UPDATE.
+// Returns array of { show_id, seat_id, booking_ref } for broadcast.
+// ─────────────────────────────────────────────────────────────────────────────
 export const sweepExpiredHolds = async () => {
   try {
-    // Atomically release expired holds:
-    // 1. Find HELD bookings past their expiry
-    // 2. Mark them as EXPIRED
-    // 3. Mark the corresponding seat as 'available'
-    const result = await pool.query(`
-      WITH expired_bookings AS (
-        UPDATE bookings 
-        SET status = 'EXPIRED' 
-        WHERE status = 'HELD' AND expires_at <= NOW() 
-        RETURNING seat_id, booking_ref, show_id
-      )
-      UPDATE seats 
-      SET status = 'available' 
-      FROM expired_bookings 
-      WHERE seats.id = expired_bookings.seat_id
-      RETURNING seats.id as seat_id, expired_bookings.show_id, expired_bookings.booking_ref;
+    const { rows, rowCount } = await query(`
+      UPDATE show_seats
+      SET
+        status      = 'available',
+        held_by     = NULL,
+        held_until  = NULL,
+        booking_ref = NULL
+      WHERE
+        status     = 'held'
+        AND held_until < NOW()
+      RETURNING show_id, seat_id, booking_ref
     `);
-    
-    if (result.rowCount > 0) {
-      console.log(`[Sweeper] Cleaned up ${result.rowCount} expired holds.`);
-      return result.rows;
+
+    if (rowCount === 0) return [];
+
+    console.log(`[Sweeper] Released ${rowCount} expired hold(s).`);
+
+    // Also expire their bookings row so the state is consistent
+    const refs = rows.map(r => r.booking_ref).filter(Boolean);
+    if (refs.length > 0) {
+      // Parameterised IN-list: UPDATE bookings SET status='expired' WHERE booking_ref = ANY($1)
+      await query(
+        `UPDATE bookings SET status = 'expired', updated_at = NOW()
+         WHERE booking_ref = ANY($1::text[])`,
+        [refs]
+      );
     }
-    return [];
+
+    // DEL Redis hold keys so seat-map fast-path matches Postgres truth
+    const redis = getRedis();
+    if (redis) {
+      const delKeys = rows.map(r => `hold:${r.show_id}:${r.seat_id}`);
+      if (delKeys.length > 0) {
+        await redis.del(delKeys).catch(err =>
+          console.error('[Sweeper] Redis DEL failed (non-fatal):', err.message)
+        );
+      }
+    }
+
+    return rows; // caller (app.js) uses these to broadcast
   } catch (err) {
-    console.error('[Sweeper] Error cleaning up expired holds:', err.message);
+    console.error('[Sweeper] Error during sweep:', err.message);
     return [];
   }
 };
 
-export const startHoldSweeper = (intervalMs = 10000, onExpired) => {
-  setInterval(async () => {
+// ─────────────────────────────────────────────────────────────────────────────
+// startHoldSweeper
+// Called once from app.js. onExpired(row) fires for each released seat.
+// ─────────────────────────────────────────────────────────────────────────────
+export const startHoldSweeper = (intervalMs = 30_000, onExpired) => {
+  const sweep = async () => {
     const expired = await sweepExpiredHolds();
-    if (expired.length > 0 && typeof onExpired === 'function') {
-      expired.forEach(e => onExpired(e));
+    if (typeof onExpired === 'function') {
+      expired.forEach(row => onExpired(row));
     }
-  }, intervalMs);
+  };
+
+  setInterval(sweep, intervalMs);
+  console.log(`[Sweeper] Hold sweeper started (every ${intervalMs / 1000}s)`);
 };
