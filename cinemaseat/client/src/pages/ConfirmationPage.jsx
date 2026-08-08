@@ -16,6 +16,21 @@ export default function ConfirmationPage() {
 
   const handleDownload = () => {
     toast.success('Downloading digital ticket SVG...');
+    const svgElement = document.querySelector('#ticket-qr-code svg');
+    if (!svgElement) {
+      toast.error('Failed to locate QR code.');
+      return;
+    }
+    const svgString = new XMLSerializer().serializeToString(svgElement);
+    const blob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `ticket-${ticketRef}.svg`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   };
 
   const handleShare = () => {
@@ -56,7 +71,7 @@ export default function ConfirmationPage() {
         </div>
 
         {/* QR Code Container */}
-        <div className="py-2">
+        <div id="ticket-qr-code" className="py-2">
           <QRCode value={`CINEMASEAT-CONFIRMED-${ticketRef}-${seatLabel}`} size={180} />
         </div>
 

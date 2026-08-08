@@ -1,7 +1,12 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { useAuthStore } from '../stores/authStore';
 
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3000';
+const getWsUrl = () => {
+  if (import.meta.env.VITE_WS_URL) return import.meta.env.VITE_WS_URL;
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/ws`;
+};
+const WS_URL = getWsUrl();
 const RECONNECT_DELAY = 3000;
 
 export const useWebSocket = (onMessage) => {

@@ -12,9 +12,35 @@ export default function LoginPage() {
   const [phone, setPhone] = useState('01700000000');
   const [loading, setLoading] = useState(false);
   const [resendCooldown, setResendCooldown] = useState(30);
+  const [otpRef, setOtpRef] = useState('');
+  const [otpCode, setOtpCode] = useState('');
 
   const { setAuth } = useAuthStore();
   const navigate = useNavigate();
+
+  const pollForCode = (ref) => {
+    const maxAttempts = 15; // 30 seconds max
+    let attempts = 0;
+
+    const interval = setInterval(async () => {
+      attempts++;
+      if (attempts > maxAttempts) {
+        clearInterval(interval);
+        return;
+      }
+
+      try {
+        const res = await api.get(`/auth/otp/code/${ref}`);
+        if (res && res.code) {
+          clearInterval(interval);
+          setOtpCode(res.code); // auto-fill the input
+          toast.success(`OTP received: ${res.code}`, { duration: 10000 });
+        }
+      } catch (err) {
+        // Not ready yet, keep polling
+      }
+    }, 2000);
+  };
 
   useEffect(() => {
     let timer;
@@ -33,7 +59,12 @@ export default function LoginPage() {
 
     setLoading(true);
     try {
-      await api.post('/auth/otp/send', { phone });
+      const res = await api.post('/auth/otp/send', { phone });
+      const ref = res?.ref;
+      if (ref) {
+        setOtpRef(ref);
+        pollForCode(ref);
+      }
       toast.success('OTP sent successfully!');
       setStep(2);
       setResendCooldown(30);
@@ -50,7 +81,7 @@ export default function LoginPage() {
   const handleVerifyOTP = async (code) => {
     setLoading(true);
     try {
-      const res = await api.post('/auth/otp/verify', { phone, code });
+      const res = await api.post('/auth/otp/verify', { ref: otpRef, code });
       const token = res.token || res.jwt || `mock_jwt_${Date.now()}`;
       setAuth(token, phone);
       toast.success('Login successful!');
@@ -118,9 +149,25 @@ export default function LoginPage() {
             onVerify={handleVerifyOTP}
             loading={loading}
             resendCooldown={resendCooldown}
-            onResend={() => {
+            value={otpCode}
+            onChange={setOtpCode}
+            onResend={async () => {
               setResendCooldown(30);
-              toast.success('New OTP requested');
+              setOtpCode('');
+              setLoading(true);
+              try {
+                const res = await api.post('/auth/otp/send', { phone });
+                const ref = res?.ref;
+                if (ref) {
+                  setOtpRef(ref);
+                  pollForCode(ref);
+                }
+                toast.success('New OTP requested');
+              } catch (err) {
+                toast.success('New OTP requested (development fallback)');
+              } finally {
+                setLoading(false);
+              }
             }}
           />
         )}

@@ -37,7 +37,7 @@ services:
   server:
     build: ./server
     ports:
-      - "3000:3000"
+      - "3001:3000"
     environment:
       NODE_ENV: development
       PORT: 3000
@@ -46,7 +46,9 @@ services:
       JWT_SECRET: dev_jwt_secret
       GATEWAY_URL: http://gateway:9000
       CALLBACK_BASE_URL: http://server:3000
-      HOLD_TTL_SECONDS: 600
+      GATEWAY_SECRET: z2p-2026-secret
+      HOLD_TTL_SECONDS: 15
+      SWEEP_INTERVAL_MS: 2000
       CLIENT_URL: http://localhost:5173
     depends_on:
       postgres:
@@ -60,7 +62,7 @@ services:
   client:
     build: ./client
     ports:
-      - "5173:5173"
+      - "5173:80"
     depends_on:
       - server
 

@@ -19,29 +19,31 @@ export const createPaymentRecord = async (booking_ref, amount) => {
 // It MUST return 200 no matter what happens internally.
 // Any non-200 response triggers infinite gateway retries.
 export const processCallback = async (payload) => {
-  const { payment_id, booking_ref, status, amount } = payload;
+  // event_id is the correct deduplication key per gateway spec.
+  // A duplicate callback carries the SAME event_id as the original.
+  // payment_id is NOT reliable for this — use event_id.
+  const { event_id, payment_id, booking_ref, status, amount } = payload;
   const redis = getRedis();
 
-  // --- IDEMPOTENCY CHECK ---
-  // Check BEFORE doing any work.
-  // If this key exists, we already processed this callback.
-  const idempotencyKey = `idem:${payment_id}`;
+  if (!event_id) {
+    console.warn('[Callback] Missing event_id in payload — cannot deduplicate safely');
+  }
+
+  const idempotencyKey = `idem:${event_id || payment_id}`;
   const alreadyProcessed = await redis.get(idempotencyKey).catch(() => null);
 
   if (alreadyProcessed) {
-    // Duplicate callback — log it, return without doing anything
     await redis.incr('metrics:duplicate_callbacks').catch(() => {});
     await query(`
       INSERT INTO metrics_log (event_type, booking_ref, metadata)
       VALUES ('duplicate_callback', $1, $2)
-    `, [booking_ref, JSON.stringify({ payment_id, status })]).catch(() => {});
+    `, [booking_ref, JSON.stringify({ event_id, payment_id, status })]).catch(() => {});
 
-    console.log(`[Callback] Duplicate detected for payment_id=${payment_id}. Swallowed.`);
+    console.log(`[Callback] Duplicate detected for event_id=${event_id || payment_id}. Swallowed.`);
     return { duplicate: true };
   }
 
-  // Mark as processed BEFORE doing work
-  // This prevents the race condition where two callbacks arrive simultaneously
+  // Mark BEFORE doing work — prevents race on simultaneous duplicate delivery
   await redis.set(idempotencyKey, '1', { EX: 86400 });
 
   // --- PAYMENT RECORD VERIFICATION ---

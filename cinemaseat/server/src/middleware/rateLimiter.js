@@ -8,7 +8,7 @@ export const otpLimiter = rateLimit({
 
 export const holdLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 20,
+  max: parseInt(process.env.HOLD_LIMIT_MAX || '1000', 10),
   message: { error: 'Too many hold requests', code: 'RATE_LIMITED' }
 });
 
