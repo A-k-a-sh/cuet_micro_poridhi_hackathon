@@ -7,7 +7,9 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import { connectPostgres } from './db/postgres.js';
+import pool from './db/postgres.js';
 import { connectRedis } from './db/redis.js';
+import redisClient from './db/redis.js';
 import authRoutes from './modules/auth/auth.routes.js';
 import catalogueRoutes from './modules/catalogue/catalogue.routes.js';
 import bookingRoutes from './modules/booking/booking.routes.js';
@@ -36,6 +38,58 @@ app.use('/api/auth', authRoutes);
 app.use('/api', catalogueRoutes);
 app.use('/api', bookingRoutes);
 app.use('/api/payments', paymentRoutes);
+
+// GET /api/metrics — live system metrics (architecture spec: wow feature)
+app.get('/api/metrics', async (req, res) => {
+  try {
+    // Count active holds in Postgres
+    const holdsResult = await pool.query(
+      "SELECT COUNT(*) FROM bookings WHERE status = 'HELD' AND expires_at > NOW()"
+    );
+
+    // Count bookings created in last 60 seconds
+    const recentResult = await pool.query(
+      "SELECT COUNT(*) FROM bookings WHERE created_at > NOW() - interval '60 seconds'"
+    );
+
+    // Count total duplicate callbacks intercepted (stored as Redis keys)
+    // We can use the SCAN to count keys matching callback:* pattern
+    let duplicateCallbacksIntercepted = 0;
+    try {
+      let cursor = 0;
+      do {
+        const reply = await redisClient.scan(cursor, { MATCH: 'callback:*', COUNT: 100 });
+        cursor = reply.cursor;
+        duplicateCallbacksIntercepted += reply.keys.length;
+      } while (cursor !== 0);
+    } catch (e) {
+      // Redis scan is best-effort, don't fail the whole request
+    }
+
+    // Check gateway health (non-blocking, short timeout)
+    let gatewayStatus = 'unknown';
+    try {
+      const gatewayUrl = process.env.GATEWAY_URL || 'http://gateway:9000';
+      const ctrl = new AbortController();
+      const timeout = setTimeout(() => ctrl.abort(), 1000);
+      const resp = await fetch(`${gatewayUrl}/health`, { signal: ctrl.signal });
+      clearTimeout(timeout);
+      gatewayStatus = resp.ok ? 'healthy' : 'degraded';
+    } catch {
+      gatewayStatus = 'down';
+    }
+
+    res.json({
+      active_holds: parseInt(holdsResult.rows[0].count, 10),
+      bookings_last_60s: parseInt(recentResult.rows[0].count, 10),
+      gateway_status: gatewayStatus,
+      duplicate_callbacks_intercepted: duplicateCallbacksIntercepted,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to gather metrics' });
+  }
+});
 
 app.use(errorHandler);
 
