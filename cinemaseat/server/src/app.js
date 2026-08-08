@@ -6,13 +6,15 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-import { connectPostgres, runMigrations } from './db/postgres.js';
+import { connectPostgres } from './db/postgres.js';
 import { connectRedis } from './db/redis.js';
 import authRoutes from './modules/auth/auth.routes.js';
 import catalogueRoutes from './modules/catalogue/catalogue.routes.js';
 import bookingRoutes from './modules/booking/booking.routes.js';
 import paymentRoutes from './modules/payment/payment.routes.js';
 import { errorHandler } from './middleware/errorHandler.js';
+import { startHoldSweeper } from './modules/booking/holdSweeper.js';
+import { broadcastToShow } from './websocket/wsServer.js';
 
 const app = express();
 
@@ -39,7 +41,6 @@ app.use(errorHandler);
 
 const start = async () => {
   await connectPostgres();
-  await runMigrations();
   await connectRedis();
 
   const PORT = process.env.PORT || 3000;
@@ -50,6 +51,21 @@ const start = async () => {
   // WebSocket server attaches to same HTTP server
   const { initWebSocket } = await import('./websocket/wsServer.js');
   initWebSocket(server);
+
+  // Start the hold sweeper, pass callback to broadcast to websocket
+  startHoldSweeper(5000, (expiredBooking) => {
+    broadcastToShow(expiredBooking.show_id, {
+      type: 'HOLD_EXPIRED',
+      booking_ref: expiredBooking.booking_ref,
+      seat_id: expiredBooking.seat_id
+    });
+    broadcastToShow(expiredBooking.show_id, {
+      type: 'SEAT_UPDATE',
+      show_id: expiredBooking.show_id,
+      seat_id: expiredBooking.seat_id,
+      status: 'available'
+    });
+  });
 };
 
 start().catch(console.error);
