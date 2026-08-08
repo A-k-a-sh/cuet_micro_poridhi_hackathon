@@ -1,23 +1,21 @@
 import pg from 'pg';
 const { Pool } = pg;
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+let pool;
 
 export const connectPostgres = async () => {
-  try {
-    const client = await pool.connect();
-    console.log('PostgreSQL connected successfully');
-    client.release();
-  } catch (err) {
-    console.error('PostgreSQL connection error:', err.message);
-  }
+  pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  await pool.query('SELECT 1');
+  console.log('PostgreSQL connected');
 };
 
-export const runMigrations = async () => {
-  console.log('Running database migrations...');
-  // Migrations will be implemented in database schema setup step
-};
+// Named exports used by every module
+export const query      = (text, params) => pool.query(text, params);
+export const getClient  = ()             => pool.connect();
+export const getPool    = ()             => pool;
 
-export default pool;
+// Default export kept for backward compat
+export default {
+  query: (text, params) => pool.query(text, params),
+  connect: () => pool.connect(),
+};
