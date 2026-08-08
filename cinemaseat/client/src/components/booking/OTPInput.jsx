@@ -1,8 +1,10 @@
 import { useState } from 'react';
 import { KeyRound } from 'lucide-react';
 
-export default function OTPInput({ onVerify, loading, resendCooldown = 30, onResend }) {
-  const [code, setCode] = useState('');
+export default function OTPInput({ onVerify, loading, resendCooldown = 30, onResend, value, onChange }) {
+  const [localCode, setLocalCode] = useState('');
+  const code = value !== undefined ? value : localCode;
+  const setCode = onChange !== undefined ? onChange : setLocalCode;
 
   const handleSubmit = (e) => {
     e.preventDefault();
