@@ -15,7 +15,7 @@
 import { Router } from 'express';
 import { holdSeat, transitionToPendingPayment, getBooking } from './booking.service.js';
 import { initiateCharge, initiateRefund } from '../payment/gateway.client.js';
-import { broadcastToShow } from '../../websocket/wsServer.js';
+import { notifySeatUpdate } from '../notification/notification.service.js';
 import { authenticate } from '../../middleware/auth.js';
 import { query, getClient } from '../../db/postgres.js';
 
@@ -38,13 +38,7 @@ router.post('/bookings/hold', authenticate, async (req, res, next) => {
     const result = await holdSeat(show_id, seat_id, phone);
 
     // WebSocket: broadcast seat held to all clients on this show
-    broadcastToShow(show_id, {
-      type:       'SEAT_UPDATE',
-      show_id,
-      seat_id,
-      status:     'held',
-      expires_at: result.expires_at,
-    });
+    notifySeatUpdate(show_id, seat_id, 'held', result.expires_at);
 
     res.status(201).json(result);
   } catch (err) {

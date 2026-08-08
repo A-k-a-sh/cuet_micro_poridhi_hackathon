@@ -12,8 +12,12 @@
 
 import { query, getClient } from '../../db/postgres.js';
 import { getRedis } from '../../db/redis.js';
-import { sendOtp } from './gateway.client.js';
-import { broadcastToShow } from '../../websocket/wsServer.js';
+import {
+  notifySeatUpdate,
+  notifyBookingConfirmed,
+  notifyPaymentFailed,
+  dispatchOtp,
+} from '../notification/notification.service.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // processPaymentCallback
@@ -107,18 +111,14 @@ export const processPaymentCallback = async (payload) => {
 
       await client.query('COMMIT');
 
-      // Fire OTP send (non-blocking, best-effort)
+      // Fire OTP send via notification module (non-blocking, best-effort)
       const otpRef = `pay_${booking_ref}`;
-      sendOtp(booking.phone, otpRef).catch(err =>
+      dispatchOtp(booking.phone, otpRef).catch(err =>
         console.error('[Payment] OTP send failed (non-fatal):', err.message)
       );
 
-      // WebSocket: notify the user their payment was accepted
-      broadcastToShow(booking.show_id, {
-        type:        'BOOKING_CONFIRMED',   // UI shows "payment ok, awaiting OTP"
-        booking_ref: booking_ref,
-        seat_id:     booking.seat_id,
-      });
+      // Notify user payment accepted, awaiting OTP
+      notifyBookingConfirmed(booking.show_id, booking_ref);
 
     } else if (status === 'FAILED') {
       // Release seat — back to available
@@ -140,17 +140,8 @@ export const processPaymentCallback = async (payload) => {
 
       await client.query('COMMIT');
 
-      broadcastToShow(booking.show_id, {
-        type:        'PAYMENT_FAILED',
-        booking_ref: booking_ref,
-        message:     'Payment was declined. Seat is available again.',
-      });
-      broadcastToShow(booking.show_id, {
-        type:    'SEAT_UPDATE',
-        show_id: booking.show_id,
-        seat_id: booking.seat_id,
-        status:  'available',
-      });
+      notifyPaymentFailed(booking.show_id, booking_ref, 'Payment was declined. Seat is available again.');
+      notifySeatUpdate(booking.show_id, booking.seat_id, 'available');
 
     } else if (status === 'REFUNDED') {
       await client.query(

@@ -14,8 +14,9 @@ import bookingRoutes   from './modules/booking/booking.routes.js';
 import paymentRoutes   from './modules/payment/payment.routes.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { startHoldSweeper } from './modules/booking/holdSweeper.js';
-import { broadcastToShow, startMetricsBroadcast } from './websocket/wsServer.js';
+import { startMetricsBroadcast } from './websocket/wsServer.js';
 import { checkGatewayHealth } from './modules/payment/gateway.client.js';
+import { notifyHoldExpired, notifySeatUpdate } from './modules/notification/notification.service.js';
 
 const app = express();
 
@@ -92,17 +93,8 @@ const start = async () => {
 
   // Start the hold sweeper every 30 s (architecture spec)
   startHoldSweeper(30_000, (expired) => {
-    broadcastToShow(expired.show_id, {
-      type:        'HOLD_EXPIRED',
-      booking_ref: expired.booking_ref,
-      seat_id:     expired.seat_id,
-    });
-    broadcastToShow(expired.show_id, {
-      type:    'SEAT_UPDATE',
-      show_id: expired.show_id,
-      seat_id: expired.seat_id,
-      status:  'available',
-    });
+    notifyHoldExpired(expired.show_id, expired.booking_ref, expired.seat_id);
+    notifySeatUpdate(expired.show_id, expired.seat_id, 'available');
   });
 };
 
