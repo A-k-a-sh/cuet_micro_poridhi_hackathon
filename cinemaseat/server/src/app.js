@@ -6,17 +6,16 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-import { connectPostgres } from './db/postgres.js';
-import pool from './db/postgres.js';
-import { connectRedis } from './db/redis.js';
-import redisClient from './db/redis.js';
-import authRoutes from './modules/auth/auth.routes.js';
+import { connectPostgres, query } from './db/postgres.js';
+import { connectRedis, getRedis } from './db/redis.js';
+import authRoutes      from './modules/auth/auth.routes.js';
 import catalogueRoutes from './modules/catalogue/catalogue.routes.js';
-import bookingRoutes from './modules/booking/booking.routes.js';
-import paymentRoutes from './modules/payment/payment.routes.js';
+import bookingRoutes   from './modules/booking/booking.routes.js';
+import paymentRoutes   from './modules/payment/payment.routes.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { startHoldSweeper } from './modules/booking/holdSweeper.js';
 import { broadcastToShow, startMetricsBroadcast } from './websocket/wsServer.js';
+import { checkGatewayHealth } from './modules/payment/gateway.client.js';
 
 const app = express();
 
@@ -25,66 +24,48 @@ app.use(cors({ origin: process.env.CLIENT_URL || '*' }));
 app.use(morgan('dev'));
 app.use(express.json());
 
-// *** JUDGING REQUIREMENT: must return 200 in under 1 second even when gateway is down ***
-app.get('/health', (req, res) => {
+// ─── JUDGING REQUIREMENT: must return 200 in < 1 s even when gateway is down ──
+app.get('/health', (_req, res) => {
   res.json({
-    status: 'ok',
+    status:    'ok',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime:    process.uptime(),
   });
 });
 
-app.use('/api/auth', authRoutes);
-app.use('/api', catalogueRoutes);
-app.use('/api', bookingRoutes);
+app.use('/api/auth',     authRoutes);
+app.use('/api',          catalogueRoutes);
+app.use('/api',          bookingRoutes);
 app.use('/api/payments', paymentRoutes);
 
-// GET /api/metrics — live system metrics (architecture spec: wow feature)
-app.get('/api/metrics', async (req, res) => {
+// ─── GET /api/metrics — live system metrics ───────────────────────────────────
+app.get('/api/metrics', async (_req, res) => {
   try {
-    // Count active holds in Postgres
-    const holdsResult = await pool.query(
-      "SELECT COUNT(*) FROM bookings WHERE status = 'HELD' AND expires_at > NOW()"
-    );
+    const [holdsRes, recentRes] = await Promise.all([
+      // Active holds: use show_seats (not bookings) — it has held_until
+      query(`SELECT COUNT(*) FROM show_seats WHERE status = 'held' AND held_until > NOW()`),
+      // Bookings confirmed in last 60 s
+      query(`SELECT COUNT(*) FROM bookings WHERE status = 'confirmed' AND updated_at > NOW() - INTERVAL '60 seconds'`),
+    ]);
 
-    // Count bookings created in last 60 seconds
-    const recentResult = await pool.query(
-      "SELECT COUNT(*) FROM bookings WHERE created_at > NOW() - interval '60 seconds'"
-    );
-
-    // Count total duplicate callbacks intercepted (stored as Redis keys)
-    // We can use the SCAN to count keys matching callback:* pattern
-    let duplicateCallbacksIntercepted = 0;
+    // Duplicate callbacks intercepted from Redis counter
+    let duplicates = 0;
     try {
-      let cursor = 0;
-      do {
-        const reply = await redisClient.scan(cursor, { MATCH: 'callback:*', COUNT: 100 });
-        cursor = reply.cursor;
-        duplicateCallbacksIntercepted += reply.keys.length;
-      } while (cursor !== 0);
-    } catch (e) {
-      // Redis scan is best-effort, don't fail the whole request
-    }
+      const redis = getRedis();
+      if (redis) {
+        const val = await redis.get('metrics:duplicate_callbacks');
+        duplicates = parseInt(val || '0', 10);
+      }
+    } catch (_) { /* best-effort */ }
 
-    // Check gateway health (non-blocking, short timeout)
-    let gatewayStatus = 'unknown';
-    try {
-      const gatewayUrl = process.env.GATEWAY_URL || 'http://gateway:9000';
-      const ctrl = new AbortController();
-      const timeout = setTimeout(() => ctrl.abort(), 1000);
-      const resp = await fetch(`${gatewayUrl}/health`, { signal: ctrl.signal });
-      clearTimeout(timeout);
-      gatewayStatus = resp.ok ? 'healthy' : 'degraded';
-    } catch {
-      gatewayStatus = 'down';
-    }
+    const gatewayStatus = await checkGatewayHealth();
 
     res.json({
-      active_holds: parseInt(holdsResult.rows[0].count, 10),
-      bookings_last_60s: parseInt(recentResult.rows[0].count, 10),
-      gateway_status: gatewayStatus,
-      duplicate_callbacks_intercepted: duplicateCallbacksIntercepted,
-      timestamp: new Date().toISOString()
+      active_holds:                    parseInt(holdsRes.rows[0].count, 10),
+      bookings_last_60s:               parseInt(recentRes.rows[0].count, 10),
+      gateway_status:                  gatewayStatus,
+      duplicate_callbacks_intercepted: duplicates,
+      timestamp:                       new Date().toISOString(),
     });
   } catch (err) {
     res.status(500).json({ error: 'Failed to gather metrics' });
@@ -107,20 +88,20 @@ const start = async () => {
   initWebSocket(server);
 
   // Push SYSTEM_METRICS to all connected clients every 10 seconds
-  startMetricsBroadcast(pool, redisClient, 10000);
+  startMetricsBroadcast(10_000);
 
-  // Start the hold sweeper, pass callback to broadcast to websocket
-  startHoldSweeper(5000, (expiredBooking) => {
-    broadcastToShow(expiredBooking.show_id, {
-      type: 'HOLD_EXPIRED',
-      booking_ref: expiredBooking.booking_ref,
-      seat_id: expiredBooking.seat_id
+  // Start the hold sweeper every 30 s (architecture spec)
+  startHoldSweeper(30_000, (expired) => {
+    broadcastToShow(expired.show_id, {
+      type:        'HOLD_EXPIRED',
+      booking_ref: expired.booking_ref,
+      seat_id:     expired.seat_id,
     });
-    broadcastToShow(expiredBooking.show_id, {
-      type: 'SEAT_UPDATE',
-      show_id: expiredBooking.show_id,
-      seat_id: expiredBooking.seat_id,
-      status: 'available'
+    broadcastToShow(expired.show_id, {
+      type:    'SEAT_UPDATE',
+      show_id: expired.show_id,
+      seat_id: expired.seat_id,
+      status:  'available',
     });
   });
 };
