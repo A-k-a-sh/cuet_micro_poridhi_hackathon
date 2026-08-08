@@ -84,7 +84,7 @@ const start = async () => {
   // Seed only if database is empty (idempotent)
   await seedDatabase();
 
-  const PORT = process.env.PORT || 3000;
+  const PORT = process.env.PORT || 5000;
   const server = app.listen(PORT, () => {
     console.log(`CinemaSeat server running on port ${PORT}`);
   });

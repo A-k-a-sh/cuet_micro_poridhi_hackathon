@@ -1,83 +1,75 @@
-/**
- * holdSweeper.js
- * Background job: sweeps expired holds from show_seats and releases Redis keys.
- * Architecture spec: src/modules/booking/holdSweeper.js
- *
- * Runs every `intervalMs` (default 30 000 ms per spec).
- * For each expired hold it:
- *   1. Resets show_seats back to 'available' in Postgres
- *   2. DELetes the Redis hold key so the seat map fast-path is consistent
- *   3. Calls onExpired(row) so wsServer can broadcast HOLD_EXPIRED + SEAT_UPDATE
- */
-
 import { query } from '../../db/postgres.js';
 import { getRedis } from '../../db/redis.js';
+import { broadcast } from '../../websocket/wsServer.js';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// sweepExpiredHolds
-// SQL from architecture/database spec — single atomic UPDATE.
-// Returns array of { show_id, seat_id, booking_ref } for broadcast.
-// ─────────────────────────────────────────────────────────────────────────────
-export const sweepExpiredHolds = async () => {
-  try {
-    const { rows, rowCount } = await query(`
-      UPDATE show_seats
-      SET
-        status      = 'available',
-        held_by     = NULL,
-        held_until  = NULL,
-        booking_ref = NULL
-      WHERE
-        status     = 'held'
-        AND held_until < NOW()
-      RETURNING show_id, seat_id, booking_ref
-    `);
+export const startHoldSweeper = () => {
+  const SWEEP_INTERVAL = 30_000; // 30 seconds
 
-    if (rowCount === 0) return [];
-
-    console.log(`[Sweeper] Released ${rowCount} expired hold(s).`);
-
-    // Also expire their bookings row so the state is consistent
-    const refs = rows.map(r => r.booking_ref).filter(Boolean);
-    if (refs.length > 0) {
-      // Parameterised IN-list: UPDATE bookings SET status='expired' WHERE booking_ref = ANY($1)
-      await query(
-        `UPDATE bookings SET status = 'expired', updated_at = NOW()
-         WHERE booking_ref = ANY($1::text[])`,
-        [refs]
-      );
-    }
-
-    // DEL Redis hold keys so seat-map fast-path matches Postgres truth
-    const redis = getRedis();
-    if (redis) {
-      const delKeys = rows.map(r => `hold:${r.show_id}:${r.seat_id}`);
-      if (delKeys.length > 0) {
-        await redis.del(delKeys).catch(err =>
-          console.error('[Sweeper] Redis DEL failed (non-fatal):', err.message)
-        );
-      }
-    }
-
-    return rows; // caller (app.js) uses these to broadcast
-  } catch (err) {
-    console.error('[Sweeper] Error during sweep:', err.message);
-    return [];
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// startHoldSweeper
-// Called once from app.js. onExpired(row) fires for each released seat.
-// ─────────────────────────────────────────────────────────────────────────────
-export const startHoldSweeper = (intervalMs = 30_000, onExpired) => {
   const sweep = async () => {
-    const expired = await sweepExpiredHolds();
-    if (typeof onExpired === 'function') {
-      expired.forEach(row => onExpired(row));
+    try {
+      // Find holds that have passed their held_until timestamp
+      const { rows: expiredHolds } = await query(`
+        UPDATE show_seats
+        SET
+          status = 'available',
+          held_by = NULL,
+          held_until = NULL,
+          booking_ref = NULL
+        WHERE
+          status = 'held'
+          AND held_until < NOW()
+        RETURNING show_id, seat_id, booking_ref
+      `);
+
+      if (expiredHolds.length === 0) return;
+
+      console.log(`[Sweeper] Released ${expiredHolds.length} expired holds`);
+
+      const redis = getRedis();
+
+      for (const hold of expiredHolds) {
+        // Update booking status
+        await query(`
+          UPDATE bookings
+          SET status = 'refunded', updated_at = NOW()
+          WHERE booking_ref = $1 AND status = 'held'
+        `, [hold.booking_ref]);
+
+        // Clean Redis key (may already be gone)
+        await redis.del(`hold:${hold.show_id}:${hold.seat_id}`).catch(() => {});
+
+        // Update metrics
+        await redis.decr('metrics:active_holds').catch(() => {});
+
+        // Log metric
+        await query(`
+          INSERT INTO metrics_log (event_type, booking_ref, metadata)
+          VALUES ('hold_expired', $1, $2)
+        `, [hold.booking_ref, JSON.stringify({ show_id: hold.show_id, seat_id: hold.seat_id })]);
+
+        // Broadcast: seat is available again
+        broadcast({
+          type: 'SEAT_UPDATE',
+          show_id: hold.show_id,
+          seat_id: hold.seat_id,
+          status: 'available',
+          expires_at: null
+        });
+
+        // Broadcast: hold expired (notify the holding user if connected)
+        broadcast({
+          type: 'HOLD_EXPIRED',
+          booking_ref: hold.booking_ref,
+          seat_id: hold.seat_id
+        });
+      }
+    } catch (err) {
+      console.error('[Sweeper] Error:', err.message);
     }
   };
 
-  setInterval(sweep, intervalMs);
-  console.log(`[Sweeper] Hold sweeper started (every ${intervalMs / 1000}s)`);
+  // Run immediately then on interval
+  sweep();
+  setInterval(sweep, SWEEP_INTERVAL);
+  console.log(`[Sweeper] Started (interval: ${SWEEP_INTERVAL / 1000}s)`);
 };
