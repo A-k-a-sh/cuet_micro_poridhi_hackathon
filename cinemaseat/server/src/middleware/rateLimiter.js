@@ -1,8 +1,19 @@
 import rateLimit from 'express-rate-limit';
 
-export const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
-  standardHeaders: true,
-  legacyHeaders: false,
+export const otpLimiter = rateLimit({
+  windowMs: 60 * 1000,     // 1 minute
+  max: 3,                   // 3 OTP requests per minute per IP
+  message: { error: 'Too many OTP requests', code: 'RATE_LIMITED' }
+});
+
+export const holdLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  message: { error: 'Too many hold requests', code: 'RATE_LIMITED' }
+});
+
+export const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 200,
+  message: { error: 'Rate limit exceeded', code: 'RATE_LIMITED' }
 });

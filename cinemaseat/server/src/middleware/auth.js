@@ -1,20 +1,18 @@
 import jwt from 'jsonwebtoken';
+import { createError } from './errorHandler.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-key';
-
-export const authenticate = (req, res, next) => {
+export const requireAuth = (req, res, next) => {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing or invalid token' });
+  if (!authHeader?.startsWith('Bearer ')) {
+    return next(createError('No token provided', 'UNAUTHORIZED'));
   }
 
-  const token = authHeader.split(' ')[1];
-  
+  const token = authHeader.slice(7);
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = { phone: payload.phone, session_id: payload.session_id };
     next();
-  } catch (err) {
-    return res.status(401).json({ error: 'Invalid or expired token' });
+  } catch {
+    next(createError('Invalid or expired token', 'UNAUTHORIZED'));
   }
 };
