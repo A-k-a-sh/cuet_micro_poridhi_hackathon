@@ -3,7 +3,7 @@ import { getRedis } from '../../db/redis.js';
 import { broadcast } from '../../websocket/wsServer.js';
 
 export const startHoldSweeper = () => {
-  const SWEEP_INTERVAL = 30_000; // 30 seconds
+  const SWEEP_INTERVAL = parseInt(process.env.SWEEP_INTERVAL_MS || '30000', 10);
 
   const sweep = async () => {
     try {
