@@ -12,7 +12,13 @@ const RECONNECT_DELAY = 3000;
 export const useWebSocket = (onMessage) => {
   const ws = useRef(null);
   const reconnectTimer = useRef(null);
+  const onMessageRef = useRef(onMessage);
   const token = useAuthStore(s => s.token);
+
+  // Always keep the ref up to date without triggering reconnects
+  useEffect(() => {
+    onMessageRef.current = onMessage;
+  }, [onMessage]);
 
   const connect = useCallback(() => {
     const url = token ? `${WS_URL}?token=${token}` : WS_URL;
@@ -26,7 +32,7 @@ export const useWebSocket = (onMessage) => {
     ws.current.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        onMessage(data);
+        onMessageRef.current(data);
       } catch {}
     };
 
@@ -38,7 +44,7 @@ export const useWebSocket = (onMessage) => {
     ws.current.onerror = () => {
       ws.current.close();
     };
-  }, [token, onMessage]);
+  }, [token]); // only reconnect when token changes, NOT on callback changes
 
   useEffect(() => {
     connect();
