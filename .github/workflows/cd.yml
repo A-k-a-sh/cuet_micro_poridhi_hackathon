@@ -24,14 +24,14 @@ jobs:
       - name: Build and push server image
         uses: docker/build-push-action@v5
         with:
-          context: ./server
+          context: ./cinemaseat/server
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/cinemaseat-server:latest
 
       - name: Build and push client image
         uses: docker/build-push-action@v5
         with:
-          context: ./client
+          context: ./cinemaseat/client
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/cinemaseat-client:latest
           build-args: |
