@@ -14,7 +14,12 @@ export const chargeGateway = async ({ amount, currency, booking_ref, callback_ur
       { amount, currency, booking_ref, callback_url },
       {
         timeout: 10_000, // 10s timeout
-        // Remove X-Mock-Mode header before production — judges will control this
+        headers: {
+          // Idempotency-Key: if /charge times out and we retry,
+          // the gateway returns the same payment_id without a second charge.
+          // booking_ref is the natural idempotency key — one charge per booking.
+          'Idempotency-Key': booking_ref,
+        }
       }
     );
 
