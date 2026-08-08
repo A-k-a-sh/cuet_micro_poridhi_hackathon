@@ -14,7 +14,6 @@ import bookingRoutes   from './modules/booking/booking.routes.js';
 import paymentRoutes   from './modules/payment/payment.routes.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { startHoldSweeper } from './modules/booking/holdSweeper.js';
-import { startMetricsBroadcast } from './websocket/wsServer.js';
 import { checkGatewayHealth } from './modules/payment/gateway.client.js';
 import { notifyHoldExpired, notifySeatUpdate } from './modules/notification/notification.service.js';
 import { seedDatabase } from './scripts/seed.js';
@@ -93,8 +92,6 @@ const start = async () => {
   const { initWebSocket } = await import('./websocket/wsServer.js');
   initWebSocket(server);
 
-  // Push SYSTEM_METRICS to all connected clients every 10 seconds
-  startMetricsBroadcast(10_000);
 
   // Start the hold sweeper every 30 s (architecture spec)
   startHoldSweeper(30_000, (expired) => {

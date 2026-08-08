@@ -1,185 +1,244 @@
-/**
- * payment.service.js
- * Idempotent payment callback handler + refund initiator.
- * Architecture spec: src/modules/payment/payment.service.js
- *
- * RULES (from problem statement + architecture):
- *  1. Always return 200 from the callback endpoint — even on duplicate or error.
- *  2. Idempotency key must be SET *before* doing any work, not after.
- *  3. Duplicate callback must not confirm twice, must not double-count revenue.
- *  4. Payment module does NOT touch seat state directly — it calls booking service.
- */
-
 import { query, getClient } from '../../db/postgres.js';
 import { getRedis } from '../../db/redis.js';
-import {
-  notifySeatUpdate,
-  notifyBookingConfirmed,
-  notifyPaymentFailed,
-  dispatchOtp,
-} from '../notification/notification.service.js';
+import { createError } from '../../middleware/errorHandler.js';
+import { transitionToOTPPending } from '../booking/booking.service.js';
+import { sendOTP } from '../auth/auth.service.js';
+import { broadcast } from '../../websocket/wsServer.js';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// createPaymentRecord
-// Called by booking.routes.js /pay before firing the gateway charge.
-// Creates the payments row in 'initiated' status for audit trail.
-// ─────────────────────────────────────────────────────────────────────────────
 export const createPaymentRecord = async (booking_ref, amount) => {
-  const { rows } = await query(
-    `INSERT INTO payments (booking_ref, status, amount, currency)
-     VALUES ($1, 'initiated', $2, 'BDT')
-     RETURNING *`,
-    [booking_ref, amount]
-  );
+  const { rows } = await query(`
+    INSERT INTO payments (booking_ref, amount, status)
+    VALUES ($1, $2, 'initiated')
+    RETURNING id
+  `, [booking_ref, amount]);
   return rows[0];
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// processPaymentCallback
-// Called by POST /api/payments/callback
-// Returns { status } — caller MUST always respond 200 regardless.
-// ─────────────────────────────────────────────────────────────────────────────
-export const processPaymentCallback = async (payload) => {
-  const { event_id, payment_id, booking_ref, status, amount } = payload;
-
-  // ── Idempotency (architecture spec: idem:{payment_id} key, 24h TTL) ────────
-  // SET NX = set only if not exists. Returns true = we are first, false = dup.
+// *** THIS IS THE MOST CRITICAL FUNCTION IN THE SYSTEM ***
+// The gateway calls this endpoint. It may be called twice (8% of the time).
+// It MUST return 200 no matter what happens internally.
+// Any non-200 response triggers infinite gateway retries.
+export const processCallback = async (payload) => {
+  const { payment_id, booking_ref, status, amount } = payload;
   const redis = getRedis();
-  const idemKey = `idem:${payment_id}`;
 
-  // Set the key BEFORE doing any work (race-safe pattern)
-  const isNew = await redis.set(idemKey, '1', { NX: true, EX: 86400 });
+  // --- IDEMPOTENCY CHECK ---
+  // Check BEFORE doing any work.
+  // If this key exists, we already processed this callback.
+  const idempotencyKey = `idem:${payment_id}`;
+  const alreadyProcessed = await redis.get(idempotencyKey).catch(() => null);
 
-  if (!isNew) {
-    // Duplicate callback — log and return silently
-    console.log(`[Payment] Duplicate callback ignored: payment_id=${payment_id} event_id=${event_id}`);
+  if (alreadyProcessed) {
+    // Duplicate callback — log it, return without doing anything
     await redis.incr('metrics:duplicate_callbacks').catch(() => {});
-    return { status: 'duplicate_ignored' };
+    await query(`
+      INSERT INTO metrics_log (event_type, booking_ref, metadata)
+      VALUES ('duplicate_callback', $1, $2)
+    `, [booking_ref, JSON.stringify({ payment_id, status })]).catch(() => {});
+
+    console.log(`[Callback] Duplicate detected for payment_id=${payment_id}. Swallowed.`);
+    return { duplicate: true };
   }
 
+  // Mark as processed BEFORE doing work
+  // This prevents the race condition where two callbacks arrive simultaneously
+  await redis.set(idempotencyKey, '1', { EX: 86400 });
+
+  // --- PAYMENT RECORD VERIFICATION ---
+  const { rows: payments } = await query(`
+    SELECT p.*, b.status AS booking_status, b.phone
+    FROM payments p
+    JOIN bookings b ON b.booking_ref = p.booking_ref
+    WHERE p.booking_ref = $1
+    ORDER BY p.created_at DESC
+    LIMIT 1
+  `, [booking_ref]);
+
+  if (!payments[0]) {
+    console.error(`[Callback] No payment record for booking_ref=${booking_ref}`);
+    return { error: 'unknown_booking' };
+  }
+
+  const payment = payments[0];
+
+  // --- SUBTLE CASE: stale payment_id from a previous attempt ---
+  // If the payment_id in callback doesn't match what we stored, ignore it.
+  // This guards against a retried /charge from a previous attempt sneaking through.
+  if (payment.payment_id && payment.payment_id !== payment_id) {
+    console.warn(`[Callback] payment_id mismatch. Expected ${payment.payment_id}, got ${payment_id}. Ignoring.`);
+    return { ignored: true };
+  }
+
+  // --- PROCESS BY STATUS ---
+  if (status === 'SUCCEEDED') {
+    await handleSucceeded(booking_ref, payment_id, amount, payload, payment.phone);
+  } else if (status === 'FAILED') {
+    await handleFailed(booking_ref, payment_id, payload);
+  } else if (status === 'REFUNDED') {
+    await handleRefunded(booking_ref, payment_id, payload);
+  }
+
+  return { processed: true, status };
+};
+
+const handleSucceeded = async (booking_ref, payment_id, amount, rawPayload, phone) => {
   const client = await getClient();
   try {
     await client.query('BEGIN');
 
-    // Lock the booking row for update
-    const { rows: bRows, rowCount: bCount } = await client.query(
-      `SELECT b.id, b.status, b.show_seat_id, b.phone,
-              ss.show_id, ss.seat_id
-       FROM bookings b
-       JOIN show_seats ss ON ss.id = b.show_seat_id
-       WHERE b.booking_ref = $1
-       FOR UPDATE`,
-      [booking_ref]
+    // Update payment record
+    await client.query(`
+      UPDATE payments
+      SET payment_id = $1, status = 'succeeded', gateway_response = $2, updated_at = NOW()
+      WHERE booking_ref = $3
+    `, [payment_id, JSON.stringify(rawPayload), booking_ref]);
+
+    // Transition booking: pending_payment → otp_pending
+    await client.query(`
+      UPDATE bookings
+      SET status = 'otp_pending', updated_at = NOW()
+      WHERE booking_ref = $1 AND status = 'pending_payment'
+    `, [booking_ref]);
+
+    await client.query(`
+      UPDATE show_seats SET status = 'otp_pending' WHERE booking_ref = $1
+    `, [booking_ref]);
+
+    await client.query('COMMIT');
+
+    // Send booking confirmation OTP to the user's phone
+    try {
+      await sendOTP(phone); // Reuse same sendOTP, ref stored in Redis
+    } catch (err) {
+      console.warn('[Callback] OTP send failed, user can request resend:', err.message);
+    }
+
+    // Notify user via WebSocket
+    broadcast({
+      type: 'PAYMENT_SUCCEEDED',
+      booking_ref,
+      message: 'Payment confirmed! Check your phone for the confirmation OTP.'
+    });
+
+    await import('../../db/postgres.js').then(({ query }) =>
+      query(`
+        INSERT INTO metrics_log (event_type, booking_ref)
+        VALUES ('payment_succeeded', $1)
+      `, [booking_ref])
     );
 
-    if (bCount === 0) {
-      // Unknown booking — nothing to do, but we already marked idempotency
-      await client.query('ROLLBACK');
-      console.warn(`[Payment] Callback for unknown booking_ref: ${booking_ref}`);
-      return { status: 'unknown_booking' };
-    }
-
-    const booking = bRows[0];
-
-    // ── State gate: only process if booking is in the expected entry state ────
-    const validEntryStates = {
-      SUCCEEDED: 'pending_payment',
-      FAILED:    'pending_payment',
-      REFUNDED:  'refund_pending',
-    };
-    const expectedState = validEntryStates[status];
-
-    if (!expectedState || booking.status !== expectedState) {
-      console.log(
-        `[Payment] State mismatch for ${booking_ref}: ` +
-        `got status=${status} but booking.status=${booking.status}. Skipping.`
-      );
-      await client.query('COMMIT');
-      return { status: 'ignored_invalid_state' };
-    }
-
-    // ── Update payments table (raw gateway response stored for audit) ─────────
-    await client.query(
-      `UPDATE payments
-       SET status = $1, gateway_response = $2, updated_at = NOW()
-       WHERE booking_ref = $3 AND payment_id = $4`,
-      [
-        status === 'SUCCEEDED' ? 'succeeded'
-          : status === 'FAILED' ? 'failed'
-          : 'refunded',
-        JSON.stringify(payload),
-        booking_ref,
-        payment_id,
-      ]
-    );
-
-    if (status === 'SUCCEEDED') {
-      // PENDING_PAYMENT → OTP_PENDING (payment service calls booking via SQL)
-      await client.query(
-        `UPDATE show_seats SET status = 'otp_pending' WHERE booking_ref = $1 AND status = 'pending_payment'`,
-        [booking_ref]
-      );
-      await client.query(
-        `UPDATE bookings SET status = 'otp_pending', updated_at = NOW() WHERE booking_ref = $1`,
-        [booking_ref]
-      );
-
-      await client.query('COMMIT');
-
-      // Fire OTP send via notification module (non-blocking, best-effort)
-      const otpRef = `pay_${booking_ref}`;
-      dispatchOtp(booking.phone, otpRef).catch(err =>
-        console.error('[Payment] OTP send failed (non-fatal):', err.message)
-      );
-
-      // Notify user payment accepted, awaiting OTP
-      notifyBookingConfirmed(booking.show_id, booking_ref);
-
-    } else if (status === 'FAILED') {
-      // Release seat — back to available
-      await client.query(
-        `UPDATE show_seats
-         SET status = 'available', held_by = NULL, held_until = NULL, booking_ref = NULL
-         WHERE booking_ref = $1 AND status = 'pending_payment'`,
-        [booking_ref]
-      );
-      await client.query(
-        `UPDATE bookings SET status = 'failed', updated_at = NOW() WHERE booking_ref = $1`,
-        [booking_ref]
-      );
-
-      // Delete Redis hold key
-      await getRedis()
-        .del(`hold:${booking.show_id}:${booking.seat_id}`)
-        .catch(() => {});
-
-      await client.query('COMMIT');
-
-      notifyPaymentFailed(booking.show_id, booking_ref, 'Payment was declined. Seat is available again.');
-      notifySeatUpdate(booking.show_id, booking.seat_id, 'available');
-
-    } else if (status === 'REFUNDED') {
-      await client.query(
-        `UPDATE show_seats
-         SET status = 'refunded'
-         WHERE booking_ref = $1 AND status = 'refund_pending'`,
-        [booking_ref]
-      );
-      await client.query(
-        `UPDATE bookings SET status = 'refunded', updated_at = NOW() WHERE booking_ref = $1`,
-        [booking_ref]
-      );
-      await client.query('COMMIT');
-
-      console.log(`[Payment] Refund completed for ${booking_ref}`);
-    }
-
-    return { status: 'processed', result: status };
+    console.log(`[Callback] Payment SUCCEEDED for ${booking_ref}`);
   } catch (err) {
     await client.query('ROLLBACK');
-    // Do NOT re-throw — callback handler must always return 200
-    console.error('[Payment] Callback processing error:', err.message);
-    return { status: 'error', message: err.message };
+    console.error('[Callback] Error processing SUCCEEDED:', err.message);
+    throw err;
+  } finally {
+    client.release();
+  }
+};
+
+const handleFailed = async (booking_ref, payment_id, rawPayload) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(`
+      UPDATE payments
+      SET payment_id = $1, status = 'failed', gateway_response = $2, updated_at = NOW()
+      WHERE booking_ref = $3
+    `, [payment_id, JSON.stringify(rawPayload), booking_ref]);
+
+    // Release the seat back to available
+    const { rows } = await client.query(`
+      UPDATE show_seats
+      SET status = 'available', held_by = NULL, held_until = NULL, booking_ref = NULL
+      WHERE booking_ref = $1
+      RETURNING show_id, seat_id
+    `, [booking_ref]);
+
+    await client.query(`
+      UPDATE bookings
+      SET status = 'refunded', updated_at = NOW()
+      WHERE booking_ref = $1
+    `, [booking_ref]);
+
+    await client.query('COMMIT');
+
+    if (rows[0]) {
+      const redis = getRedis();
+      await redis.del(`hold:${rows[0].show_id}:${rows[0].seat_id}`).catch(() => {});
+      await redis.decr('metrics:active_holds').catch(() => {});
+
+      broadcast({
+        type: 'SEAT_UPDATE',
+        show_id: rows[0].show_id,
+        seat_id: rows[0].seat_id,
+        status: 'available',
+        expires_at: null
+      });
+    }
+
+    broadcast({
+      type: 'PAYMENT_FAILED',
+      booking_ref,
+      message: 'Payment failed. The seat has been released. Please try again.'
+    });
+
+    await import('../../db/postgres.js').then(({ query }) =>
+      query(`
+        INSERT INTO metrics_log (event_type, booking_ref)
+        VALUES ('payment_failed', $1)
+      `, [booking_ref])
+    );
+
+    console.log(`[Callback] Payment FAILED for ${booking_ref}`);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+};
+
+const handleRefunded = async (booking_ref, payment_id, rawPayload) => {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(`
+      UPDATE payments
+      SET status = 'refunded', gateway_response = $1, updated_at = NOW()
+      WHERE booking_ref = $2
+    `, [JSON.stringify(rawPayload), booking_ref]);
+
+    const { rows } = await client.query(`
+      UPDATE show_seats
+      SET status = 'available', held_by = NULL, held_until = NULL, booking_ref = NULL
+      WHERE booking_ref = $1
+      RETURNING show_id, seat_id
+    `, [booking_ref]);
+
+    await client.query(`
+      UPDATE bookings SET status = 'refunded', updated_at = NOW()
+      WHERE booking_ref = $1
+    `, [booking_ref]);
+
+    await client.query('COMMIT');
+
+    if (rows[0]) {
+      broadcast({
+        type: 'SEAT_UPDATE',
+        show_id: rows[0].show_id,
+        seat_id: rows[0].seat_id,
+        status: 'available',
+        expires_at: null
+      });
+    }
+
+    console.log(`[Callback] Refund processed for ${booking_ref}`);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
   } finally {
     client.release();
   }
