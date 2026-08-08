@@ -73,5 +73,5 @@ jobs:
             
             # Health check
             sleep 3
-            curl -f http://localhost:3000/health || exit 1
+            curl -f http://localhost:3001/health || exit 1
             echo "Deployment successful"
