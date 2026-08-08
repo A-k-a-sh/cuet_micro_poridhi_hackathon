@@ -1,130 +1,180 @@
-/**
- * wsServer.js
- * WebSocket server — room subscriptions and broadcast helpers.
- * Architecture spec: src/websocket/wsServer.js
- *
- * WebSocket events (Server → Client):
- *   { type: 'SEAT_UPDATE',     show_id, seat_id, status, expires_at }
- *   { type: 'BOOKING_CONFIRMED', booking_ref, qr_data }
- *   { type: 'PAYMENT_FAILED',    booking_ref, message }
- *   { type: 'HOLD_EXPIRED',      booking_ref, seat_id }
- *   { type: 'SYSTEM_METRICS',    active_holds, bookings_last_60s, gateway_status, duplicate_callbacks_intercepted }
- *
- * WebSocket events (Client → Server):
- *   { type: 'SUBSCRIBE_SHOW',   show_id }
- *   { type: 'UNSUBSCRIBE_SHOW', show_id }
- */
+import { WebSocketServer, WebSocket } from 'ws';
+import jwt from 'jsonwebtoken';
 
-import { WebSocketServer } from 'ws';
-import { query } from '../db/postgres.js';
-import { getRedis } from '../db/redis.js';
-import { checkGatewayHealth } from '../modules/payment/gateway.client.js';
+// rooms: Map<show_id, Set<WebSocket>>
+const rooms = new Map();
+
+// All connected clients (for system-wide broadcasts)
+const allClients = new Set();
 
 let wss;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// initWebSocket — called once from app.js with the HTTP server
-// ─────────────────────────────────────────────────────────────────────────────
-export const initWebSocket = (server) => {
-  wss = new WebSocketServer({ server });
+export const initWebSocket = (httpServer) => {
+  wss = new WebSocketServer({ server: httpServer });
 
-  wss.on('connection', (ws) => {
-    console.log('[WS] Client connected');
-    ws.subscribedShowId = null;
+  wss.on('connection', (ws, req) => {
+    // Optionally authenticate via token in query string
+    // ws://localhost:3000?token=JWT
+    const url = new URL(req.url, 'ws://localhost');
+    const token = url.searchParams.get('token');
+    let phone = null;
 
-    ws.on('message', (buf) => {
+    if (token) {
       try {
-        const msg = JSON.parse(buf.toString());
-        if (msg.type === 'SUBSCRIBE_SHOW') {
-          ws.subscribedShowId = String(msg.show_id);
-          console.log(`[WS] Client subscribed to show: ${ws.subscribedShowId}`);
-        } else if (msg.type === 'UNSUBSCRIBE_SHOW') {
-          if (ws.subscribedShowId === String(msg.show_id)) {
-            ws.subscribedShowId = null;
-          }
-        }
-      } catch (err) {
-        console.error('[WS] Parse error:', err.message);
+        const payload = jwt.verify(token, process.env.JWT_SECRET);
+        phone = payload.phone;
+        ws.phone = phone;
+      } catch {
+        // Unauthenticated connection is fine — can still receive seat updates
+      }
+    }
+
+    allClients.add(ws);
+    ws.subscribedShows = new Set();
+
+    ws.on('message', (data) => {
+      try {
+        const message = JSON.parse(data.toString());
+        handleClientMessage(ws, message);
+      } catch {
+        // Ignore malformed messages
       }
     });
 
     ws.on('close', () => {
-      console.log('[WS] Client disconnected');
-      ws.subscribedShowId = null;
+      allClients.delete(ws);
+      // Remove from all show rooms
+      for (const show_id of ws.subscribedShows) {
+        const room = rooms.get(show_id);
+        if (room) room.delete(ws);
+      }
     });
+
+    ws.on('error', (err) => {
+      console.error('[WS] Client error:', err.message);
+    });
+
+    // Send initial connected acknowledgement
+    safeSend(ws, { type: 'CONNECTED', timestamp: new Date().toISOString() });
   });
+
+  // Push system metrics to all clients every 5 seconds
+  startMetricsPush();
 
   console.log('[WS] WebSocket server initialized');
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// broadcast — send to ALL connected clients
-// ─────────────────────────────────────────────────────────────────────────────
-export const broadcast = (data) => {
-  if (!wss) return;
-  const payload = JSON.stringify(data);
-  wss.clients.forEach((client) => {
-    if (client.readyState === 1) client.send(payload);
-  });
-};
+const handleClientMessage = (ws, message) => {
+  switch (message.type) {
+    case 'SUBSCRIBE_SHOW': {
+      const { show_id } = message;
+      if (!show_id) return;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// broadcastToShow — send only to clients subscribed to a specific show
-// ─────────────────────────────────────────────────────────────────────────────
-export const broadcastToShow = (showId, data) => {
-  if (!wss) return;
-  const payload     = JSON.stringify(data);
-  const targetId    = String(showId);
-  let   count       = 0;
+      if (!rooms.has(show_id)) rooms.set(show_id, new Set());
+      rooms.get(show_id).add(ws);
+      ws.subscribedShows.add(show_id);
 
-  wss.clients.forEach((client) => {
-    if (client.readyState === 1 && client.subscribedShowId === targetId) {
-      client.send(payload);
-      count++;
+      safeSend(ws, { type: 'SUBSCRIBED', show_id });
+      break;
     }
-  });
+    case 'UNSUBSCRIBE_SHOW': {
+      const { show_id } = message;
+      if (!show_id) return;
 
-  console.log(`[WS] ${data.type} → show ${showId} (${count} client(s))`);
+      const room = rooms.get(show_id);
+      if (room) room.delete(ws);
+      ws.subscribedShows.delete(show_id);
+      break;
+    }
+    case 'PING': {
+      safeSend(ws, { type: 'PONG' });
+      break;
+    }
+  }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// startMetricsBroadcast — push SYSTEM_METRICS to all clients periodically
-// Architecture spec: { type: 'SYSTEM_METRICS', active_holds, bookings_last_60s,
-//                       gateway_status, duplicate_callbacks_intercepted }
-// ─────────────────────────────────────────────────────────────────────────────
-export const startMetricsBroadcast = (intervalMs = 10_000) => {
-  const gatherAndBroadcast = async () => {
-    if (!wss || wss.clients.size === 0) return; // no-op if nobody connected
+// Broadcast to all clients subscribed to a specific show
+// Also broadcasts to the specific user if they're watching their booking
+export const broadcast = (event) => {
+  const { show_id, booking_ref } = event;
+  const payload = JSON.stringify(event);
+
+  if (show_id) {
+    const room = rooms.get(show_id);
+    if (room) {
+      for (const client of room) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(payload);
+        }
+      }
+    }
+  }
+
+  // For booking-specific events (BOOKING_CONFIRMED, PAYMENT_FAILED, HOLD_EXPIRED),
+  // also send to the booking owner if they're connected (any room)
+  if (booking_ref) {
+    for (const client of allClients) {
+      if (client.readyState === WebSocket.OPEN && client.phone) {
+        // We can't easily filter by booking_ref here without a lookup,
+        // so broadcast BOOKING_* events to authenticated users broadly.
+        // The frontend filters by booking_ref.
+        client.send(payload);
+      }
+    }
+  }
+};
+
+// Broadcast to ALL clients regardless of show subscription
+export const broadcastAll = (event) => {
+  const payload = JSON.stringify(event);
+  for (const client of allClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
+};
+
+const safeSend = (ws, data) => {
+  try {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(data));
+    }
+  } catch {
+    // Ignore send errors
+  }
+};
+
+// Push live metrics to all clients every 5 seconds
+const startMetricsPush = () => {
+  setInterval(async () => {
+    if (allClients.size === 0) return;
 
     try {
-      const [holdsRes, recentRes] = await Promise.all([
-        query(`SELECT COUNT(*) FROM show_seats WHERE status = 'held' AND held_until > NOW()`),
-        query(`SELECT COUNT(*) FROM bookings WHERE status = 'confirmed' AND updated_at > NOW() - INTERVAL '60 seconds'`),
+      const { getRedis } = await import('../db/redis.js');
+      const { query } = await import('../db/postgres.js');
+      const redis = getRedis();
+
+      const [activeHolds, duplicates, gatewayStatus, recentBookings] = await Promise.all([
+        redis.get('metrics:active_holds').catch(() => '0'),
+        redis.get('metrics:duplicate_callbacks').catch(() => '0'),
+        redis.get('metrics:gateway_status').catch(() => 'unknown'),
+        query(`
+          SELECT COUNT(*) FROM bookings
+          WHERE status = 'confirmed' AND updated_at > NOW() - INTERVAL '60 seconds'
+        `).catch(() => ({ rows: [{ count: '0' }] }))
       ]);
 
-      let duplicates = 0;
-      try {
-        const redis = getRedis();
-        if (redis) {
-          const val = await redis.get('metrics:duplicate_callbacks');
-          duplicates = parseInt(val || '0', 10);
-        }
-      } catch (_) { /* best-effort */ }
-
-      const gatewayStatus = await checkGatewayHealth();
-
-      broadcast({
-        type:                            'SYSTEM_METRICS',
-        active_holds:                    parseInt(holdsRes.rows[0].count, 10),
-        bookings_last_60s:               parseInt(recentRes.rows[0].count, 10),
-        gateway_status:                  gatewayStatus,
-        duplicate_callbacks_intercepted: duplicates,
+      broadcastAll({
+        type: 'SYSTEM_METRICS',
+        active_holds: parseInt(activeHolds || 0),
+        bookings_last_60s: parseInt(recentBookings.rows[0].count),
+        duplicate_callbacks_intercepted: parseInt(duplicates || 0),
+        gateway_status: gatewayStatus || 'unknown',
+        connected_clients: allClients.size,
+        timestamp: new Date().toISOString()
       });
-    } catch (err) {
-      console.error('[WS Metrics] Gather error:', err.message);
+    } catch {
+      // Ignore metrics push errors
     }
-  };
-
-  setInterval(gatherAndBroadcast, intervalMs);
-  console.log(`[WS] SYSTEM_METRICS broadcast started (every ${intervalMs / 1000}s)`);
+  }, 5_000);
 };
