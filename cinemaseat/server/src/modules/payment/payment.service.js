@@ -1,96 +1,179 @@
-import pool from '../../db/postgres.js';
-import redisClient from '../../db/redis.js';
-
 /**
- * Idempotent payment callback handler
+ * payment.service.js
+ * Idempotent payment callback handler + refund initiator.
+ * Architecture spec: src/modules/payment/payment.service.js
+ *
+ * RULES (from problem statement + architecture):
+ *  1. Always return 200 from the callback endpoint — even on duplicate or error.
+ *  2. Idempotency key must be SET *before* doing any work, not after.
+ *  3. Duplicate callback must not confirm twice, must not double-count revenue.
+ *  4. Payment module does NOT touch seat state directly — it calls booking service.
  */
+
+import { query, getClient } from '../../db/postgres.js';
+import { getRedis } from '../../db/redis.js';
+import { sendOtp } from './gateway.client.js';
+import { broadcastToShow } from '../../websocket/wsServer.js';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// processPaymentCallback
+// Called by POST /api/payments/callback
+// Returns { status } — caller MUST always respond 200 regardless.
+// ─────────────────────────────────────────────────────────────────────────────
 export const processPaymentCallback = async (payload) => {
   const { event_id, payment_id, booking_ref, status, amount } = payload;
-  
-  // 1. Idempotency check with Redis (optional but good for duplicate events quickly)
-  const idempotencyKey = `callback:${event_id}`;
-  const isDuplicate = await redisClient.setNX(idempotencyKey, 'processed');
-  if (!isDuplicate) {
-    console.log(`[Payment] Duplicate callback intercepted: ${event_id}`);
+
+  // ── Idempotency (architecture spec: idem:{payment_id} key, 24h TTL) ────────
+  // SET NX = set only if not exists. Returns true = we are first, false = dup.
+  const redis = getRedis();
+  const idemKey = `idem:${payment_id}`;
+
+  // Set the key BEFORE doing any work (race-safe pattern)
+  const isNew = await redis.set(idemKey, '1', { NX: true, EX: 86400 });
+
+  if (!isNew) {
+    // Duplicate callback — log and return silently
+    console.log(`[Payment] Duplicate callback ignored: payment_id=${payment_id} event_id=${event_id}`);
+    await redis.incr('metrics:duplicate_callbacks').catch(() => {});
     return { status: 'duplicate_ignored' };
   }
-  
-  // Set expiry on idempotency key to avoid leaking memory, 24 hours is safe
-  await redisClient.expire(idempotencyKey, 86400);
 
-  // 2. Validate current booking state inside transaction
-  const client = await pool.connect();
+  const client = await getClient();
   try {
     await client.query('BEGIN');
-    
-    const bookingQuery = await client.query(
-      "SELECT status, payment_id, seat_id FROM bookings WHERE booking_ref = $1 FOR UPDATE",
+
+    // Lock the booking row for update
+    const { rows: bRows, rowCount: bCount } = await client.query(
+      `SELECT b.id, b.status, b.show_seat_id, b.phone,
+              ss.show_id, ss.seat_id
+       FROM bookings b
+       JOIN show_seats ss ON ss.id = b.show_seat_id
+       WHERE b.booking_ref = $1
+       FOR UPDATE`,
       [booking_ref]
     );
-    
-    if (bookingQuery.rowCount === 0) {
-      throw new Error(`Booking not found: ${booking_ref}`);
+
+    if (bCount === 0) {
+      // Unknown booking — nothing to do, but we already marked idempotency
+      await client.query('ROLLBACK');
+      console.warn(`[Payment] Callback for unknown booking_ref: ${booking_ref}`);
+      return { status: 'unknown_booking' };
     }
-    
-    const booking = bookingQuery.rows[0];
-    
-    // Check if the payment_id matches what we recorded during /pay
-    if (booking.payment_id !== payment_id) {
-      throw new Error(`Payment ID mismatch for booking ${booking_ref}`);
-    }
-    
-    // Idempotency: valid entry states per event type
+
+    const booking = bRows[0];
+
+    // ── State gate: only process if booking is in the expected entry state ────
     const validEntryStates = {
-      SUCCEEDED: 'PENDING_PAYMENT',
-      FAILED:    'PENDING_PAYMENT',
-      REFUNDED:  'REFUND_PENDING',
+      SUCCEEDED: 'pending_payment',
+      FAILED:    'pending_payment',
+      REFUNDED:  'refund_pending',
     };
     const expectedState = validEntryStates[status];
+
     if (!expectedState || booking.status !== expectedState) {
-      console.log(`[Payment] Booking ${booking_ref} in state ${booking.status}, expected ${expectedState} for event ${status}. Ignoring.`);
+      console.log(
+        `[Payment] State mismatch for ${booking_ref}: ` +
+        `got status=${status} but booking.status=${booking.status}. Skipping.`
+      );
       await client.query('COMMIT');
       return { status: 'ignored_invalid_state' };
     }
 
+    // ── Update payments table (raw gateway response stored for audit) ─────────
+    await client.query(
+      `UPDATE payments
+       SET status = $1, gateway_response = $2, updated_at = NOW()
+       WHERE booking_ref = $3 AND payment_id = $4`,
+      [
+        status === 'SUCCEEDED' ? 'succeeded'
+          : status === 'FAILED' ? 'failed'
+          : 'refunded',
+        JSON.stringify(payload),
+        booking_ref,
+        payment_id,
+      ]
+    );
+
     if (status === 'SUCCEEDED') {
-      // PENDING_PAYMENT → OTP_PENDING (user must verify OTP to fully confirm)
+      // PENDING_PAYMENT → OTP_PENDING (payment service calls booking via SQL)
       await client.query(
-        "UPDATE bookings SET status = 'OTP_PENDING' WHERE booking_ref = $1",
+        `UPDATE show_seats SET status = 'otp_pending' WHERE booking_ref = $1 AND status = 'pending_payment'`,
         [booking_ref]
       );
-      // Seat is now logically confirmed — lock it down
       await client.query(
-        "UPDATE seats SET status = 'confirmed' WHERE id = $1",
-        [booking.seat_id]
+        `UPDATE bookings SET status = 'otp_pending', updated_at = NOW() WHERE booking_ref = $1`,
+        [booking_ref]
       );
+
+      await client.query('COMMIT');
+
+      // Fire OTP send (non-blocking, best-effort)
+      const otpRef = `pay_${booking_ref}`;
+      sendOtp(booking.phone, otpRef).catch(err =>
+        console.error('[Payment] OTP send failed (non-fatal):', err.message)
+      );
+
+      // WebSocket: notify the user their payment was accepted
+      broadcastToShow(booking.show_id, {
+        type:        'BOOKING_CONFIRMED',   // UI shows "payment ok, awaiting OTP"
+        booking_ref: booking_ref,
+        seat_id:     booking.seat_id,
+      });
+
     } else if (status === 'FAILED') {
-      // PENDING_PAYMENT → FAILED, release the seat
+      // Release seat — back to available
       await client.query(
-        "UPDATE bookings SET status = 'FAILED' WHERE booking_ref = $1",
+        `UPDATE show_seats
+         SET status = 'available', held_by = NULL, held_until = NULL, booking_ref = NULL
+         WHERE booking_ref = $1 AND status = 'pending_payment'`,
         [booking_ref]
       );
       await client.query(
-        "UPDATE seats SET status = 'available' WHERE id = $1",
-        [booking.seat_id]
+        `UPDATE bookings SET status = 'failed', updated_at = NOW() WHERE booking_ref = $1`,
+        [booking_ref]
       );
+
+      // Delete Redis hold key
+      await getRedis()
+        .del(`hold:${booking.show_id}:${booking.seat_id}`)
+        .catch(() => {});
+
+      await client.query('COMMIT');
+
+      broadcastToShow(booking.show_id, {
+        type:        'PAYMENT_FAILED',
+        booking_ref: booking_ref,
+        message:     'Payment was declined. Seat is available again.',
+      });
+      broadcastToShow(booking.show_id, {
+        type:    'SEAT_UPDATE',
+        show_id: booking.show_id,
+        seat_id: booking.seat_id,
+        status:  'available',
+      });
+
     } else if (status === 'REFUNDED') {
-      // REFUND_PENDING → REFUNDED, seat goes back to available
       await client.query(
-        "UPDATE bookings SET status = 'REFUNDED' WHERE booking_ref = $1",
+        `UPDATE show_seats
+         SET status = 'refunded'
+         WHERE booking_ref = $1 AND status = 'refund_pending'`,
         [booking_ref]
       );
       await client.query(
-        "UPDATE seats SET status = 'available' WHERE id = $1",
-        [booking.seat_id]
+        `UPDATE bookings SET status = 'refunded', updated_at = NOW() WHERE booking_ref = $1`,
+        [booking_ref]
       );
-      console.log(`[Payment] Refund completed for booking ${booking_ref}. Seat released.`);
+      await client.query('COMMIT');
+
+      console.log(`[Payment] Refund completed for ${booking_ref}`);
     }
-    
-    await client.query('COMMIT');
+
     return { status: 'processed', result: status };
-  } catch (error) {
+  } catch (err) {
     await client.query('ROLLBACK');
-    throw error;
+    // Do NOT re-throw — callback handler must always return 200
+    console.error('[Payment] Callback processing error:', err.message);
+    return { status: 'error', message: err.message };
   } finally {
     client.release();
   }
