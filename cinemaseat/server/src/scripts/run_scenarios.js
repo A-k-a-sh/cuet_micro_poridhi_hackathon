@@ -2,7 +2,7 @@ import axios from 'axios';
 import { execSync } from 'child_process';
 import { getJwtForPhone } from './get_jwt.js';
 
-const BASE_URL = 'http://localhost:3000';
+const BASE_URL = 'http://localhost:3001';
 const DOCKER_BASE_URL = 'http://server:3000';
 
 async function run() {

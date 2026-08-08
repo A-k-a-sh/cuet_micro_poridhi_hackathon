@@ -102,8 +102,9 @@ const handleSucceeded = async (booking_ref, payment_id, amount, rawPayload, phon
       WHERE booking_ref = $1 AND status = 'pending_payment'
     `, [booking_ref]);
 
-    await client.query(`
+    const { rows: seatRows } = await client.query(`
       UPDATE show_seats SET status = 'otp_pending' WHERE booking_ref = $1
+      RETURNING show_id, seat_id
     `, [booking_ref]);
 
     await client.query('COMMIT');
@@ -121,6 +122,16 @@ const handleSucceeded = async (booking_ref, payment_id, amount, rawPayload, phon
       booking_ref,
       message: 'Payment confirmed! Check your phone for the confirmation OTP.'
     });
+
+    if (seatRows[0]) {
+      broadcast({
+        type: 'SEAT_UPDATE',
+        show_id: seatRows[0].show_id,
+        seat_id: seatRows[0].seat_id,
+        status: 'otp_pending',
+        expires_at: null
+      });
+    }
 
     await import('../../db/postgres.js').then(({ query }) =>
       query(`

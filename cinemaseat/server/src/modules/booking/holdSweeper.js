@@ -16,7 +16,7 @@ export const startHoldSweeper = () => {
           held_until = NULL,
           booking_ref = NULL
         WHERE
-          status = 'held'
+          status IN ('held', 'pending_payment', 'otp_pending')
           AND held_until < NOW()
         RETURNING show_id, seat_id, booking_ref
       `);
@@ -31,8 +31,8 @@ export const startHoldSweeper = () => {
         // Update booking status
         await query(`
           UPDATE bookings
-          SET status = 'refunded', updated_at = NOW()
-          WHERE booking_ref = $1 AND status = 'held'
+          SET status = 'failed', updated_at = NOW()
+          WHERE booking_ref = $1 AND status IN ('held', 'pending_payment', 'otp_pending')
         `, [hold.booking_ref]);
 
         // Clean Redis key (may already be gone)

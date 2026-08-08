@@ -128,10 +128,11 @@ export const confirmBookingAfterOTP = async (booking_ref, phone) => {
 
     if (!rows[0]) throw createError('Cannot confirm booking', 'CONFLICT');
 
-    await client.query(`
+    const { rows: seatRows } = await client.query(`
       UPDATE show_seats
       SET status = 'confirmed'
       WHERE booking_ref = $1
+      RETURNING show_id, seat_id
     `, [booking_ref]);
 
     await client.query('COMMIT');
@@ -157,6 +158,16 @@ export const confirmBookingAfterOTP = async (booking_ref, phone) => {
       show_id: booking.show_id
     });
 
+    if (seatRows[0]) {
+      broadcast({
+        type: 'SEAT_UPDATE',
+        show_id: seatRows[0].show_id,
+        seat_id: seatRows[0].seat_id,
+        status: 'confirmed',
+        expires_at: null
+      });
+    }
+
     return { booking, qr_data };
   } catch (err) {
     await client.query('ROLLBACK');
@@ -176,9 +187,20 @@ export const cancelBooking = async (booking_ref, phone) => {
 
   if (!rows[0]) throw createError('Booking not found or cannot be cancelled', 'CONFLICT');
 
-  await query(`
+  const { rows: seatRows } = await query(`
     UPDATE show_seats SET status = 'refund_pending' WHERE booking_ref = $1
+    RETURNING show_id, seat_id
   `, [booking_ref]);
+
+  if (seatRows[0]) {
+    broadcast({
+      type: 'SEAT_UPDATE',
+      show_id: seatRows[0].show_id,
+      seat_id: seatRows[0].seat_id,
+      status: 'refund_pending',
+      expires_at: null
+    });
+  }
 
   return rows[0];
 };

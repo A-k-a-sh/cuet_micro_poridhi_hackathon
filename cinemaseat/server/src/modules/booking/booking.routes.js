@@ -60,6 +60,16 @@ router.post('/bookings/:ref/pay', requireAuth, async (req, res, next) => {
       `, [booking.booking_ref])
     );
 
+    await import('../../websocket/wsServer.js').then(({ broadcast }) =>
+      broadcast({
+        type: 'SEAT_UPDATE',
+        show_id: booking.show_id,
+        seat_id: booking.seat_id,
+        status: 'pending_payment',
+        expires_at: null
+      })
+    ).catch(err => console.error('[Pay] Broadcast error:', err.message));
+
     // Fire gateway charge — DO NOT AWAIT the result
     // The callback_url is where the gateway will send the result
     const callback_url = `${process.env.CALLBACK_BASE_URL}/api/payments/callback`;

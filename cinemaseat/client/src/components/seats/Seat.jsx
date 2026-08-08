@@ -7,6 +7,8 @@ const statusConfig = {
   confirmed:       { bg: 'bg-[#3F3F5A] opacity-70', hover: '', cursor: 'cursor-not-allowed' },
   taken:           { bg: 'bg-[#3F3F5A] opacity-70', hover: '', cursor: 'cursor-not-allowed' },
   pending_payment: { bg: 'bg-[#F5A623] opacity-60', hover: '', cursor: 'cursor-not-allowed' },
+  otp_pending:     { bg: 'bg-[#3F3F5A] opacity-70', hover: '', cursor: 'cursor-not-allowed' },
+  refund_pending:  { bg: 'bg-[#3F3F5A] opacity-70', hover: '', cursor: 'cursor-not-allowed' },
 };
 
 export default function Seat({ seat, isSelected, onClick }) {
