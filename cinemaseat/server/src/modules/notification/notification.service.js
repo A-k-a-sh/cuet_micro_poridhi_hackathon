@@ -11,7 +11,7 @@
  * wsServer or gateway.client directly, keeping module boundaries clean.
  */
 
-import { broadcastToShow, broadcast } from '../../websocket/wsServer.js';
+import { broadcast } from '../../websocket/wsServer.js';
 import { sendOTP as sendOtp, verifyOTP as verifyOtp } from '../auth/auth.service.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -23,7 +23,7 @@ import { sendOTP as sendOtp, verifyOTP as verifyOtp } from '../auth/auth.service
  * { type: 'SEAT_UPDATE', show_id, seat_id, status, expires_at? }
  */
 export const notifySeatUpdate = (showId, seatId, status, expiresAt = null) => {
-  broadcastToShow(showId, {
+  broadcast({
     type:       'SEAT_UPDATE',
     show_id:    showId,
     seat_id:    seatId,
@@ -37,8 +37,9 @@ export const notifySeatUpdate = (showId, seatId, status, expiresAt = null) => {
  * { type: 'BOOKING_CONFIRMED', booking_ref, qr_data? }
  */
 export const notifyBookingConfirmed = (showId, bookingRef, qrData = null) => {
-  broadcastToShow(showId, {
+  broadcast({
     type:        'BOOKING_CONFIRMED',
+    show_id:     showId,
     booking_ref: bookingRef,
     ...(qrData && { qr_data: qrData }),
   });
@@ -49,8 +50,9 @@ export const notifyBookingConfirmed = (showId, bookingRef, qrData = null) => {
  * { type: 'PAYMENT_FAILED', booking_ref, message }
  */
 export const notifyPaymentFailed = (showId, bookingRef, message = 'Payment was declined.') => {
-  broadcastToShow(showId, {
+  broadcast({
     type:        'PAYMENT_FAILED',
+    show_id:     showId,
     booking_ref: bookingRef,
     message,
   });
@@ -61,8 +63,9 @@ export const notifyPaymentFailed = (showId, bookingRef, message = 'Payment was d
  * { type: 'HOLD_EXPIRED', booking_ref, seat_id }
  */
 export const notifyHoldExpired = (showId, bookingRef, seatId) => {
-  broadcastToShow(showId, {
+  broadcast({
     type:        'HOLD_EXPIRED',
+    show_id:     showId,
     booking_ref: bookingRef,
     seat_id:     seatId,
   });
