@@ -19,13 +19,13 @@ export const createPaymentRecord = async (booking_ref, amount) => {
 // It MUST return 200 no matter what happens internally.
 // Any non-200 response triggers infinite gateway retries.
 export const processCallback = async (payload) => {
-  const { payment_id, booking_ref, status, amount } = payload;
+  const { event_id, payment_id, booking_ref, status, amount } = payload;
   const redis = getRedis();
 
   // --- IDEMPOTENCY CHECK ---
   // Check BEFORE doing any work.
   // If this key exists, we already processed this callback.
-  const idempotencyKey = `idem:${payment_id}`;
+  const idempotencyKey = `idem:${event_id || payment_id}`;
   const alreadyProcessed = await redis.get(idempotencyKey).catch(() => null);
 
   if (alreadyProcessed) {
