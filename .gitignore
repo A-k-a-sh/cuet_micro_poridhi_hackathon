@@ -2,3 +2,5 @@
 building guide/*
 
 .env
+
+node_modules
